@@ -1,0 +1,855 @@
+name: Build EclipsGuard
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Write sources
+        run: |
+          mkdir -p eg/src/main/java/eclips/guard eg/src/main/resources
+          cat > eg/pom.xml <<'EOF_POM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>eclips</groupId>
+              <artifactId>EclipsGuard</artifactId>
+              <version>1.3.0</version>
+              <packaging>jar</packaging>
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+              <build>
+                  <finalName>EclipsGuard</finalName>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.11.0</version>
+                          <configuration>
+                              <release>17</release>
+                              <encoding>UTF-8</encoding>
+                          </configuration>
+                      </plugin>
+                  </plugins>
+              </build>
+          </project>
+          EOF_POM
+          cat > eg/src/main/resources/plugin.yml <<'EOF_PLUGIN'
+          name: EclipsGuard
+          main: eclips.guard.EclipsGuard
+          version: "1.3.0"
+          api: ["1.0.0"]
+          author: Eclips
+          description: "Защита от админов: запрет бедрока/барьера/рамок портала/командных блоков; в креативе инвентарь сохраняется и очищается, предметы не выбросить"
+          commands:
+            gmhack:
+              description: Снять ограничения EclipsGuard (с себя или с игрока)
+              usage: /gmhack [ник] <on/off>
+              permission: eclipsguard.gmhack
+          permissions:
+            eclipsguard.gmhack:
+              description: Снимать ограничения EclipsGuard
+              default: op
+          EOF_PLUGIN
+          cat > eg/src/main/java/eclips/guard/EclipsGuard.java <<'EOF_JAVA'
+          package eclips.guard;
+          
+          import cn.nukkit.Player;
+          import cn.nukkit.block.BlockFall;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.entity.projectile.EntityProjectile;
+          import cn.nukkit.event.Cancellable;
+          import cn.nukkit.event.Event;
+          import cn.nukkit.event.block.BlockFromToEvent;
+          import cn.nukkit.event.block.BlockGrowEvent;
+          import cn.nukkit.event.block.BlockUpdateEvent;
+          import cn.nukkit.event.block.LeavesDecayEvent;
+          import cn.nukkit.event.entity.EntityShootBowEvent;
+          import cn.nukkit.event.entity.ProjectileLaunchEvent;
+          import cn.nukkit.event.level.StructureGrowEvent;
+          import cn.nukkit.event.player.PlayerDeathEvent;
+          import cn.nukkit.event.player.PlayerInteractEntityEvent;
+          import java.util.Collection;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.block.BlockBreakEvent;
+          import cn.nukkit.event.block.BlockPlaceEvent;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.entity.EntityExplodeEvent;
+          import cn.nukkit.event.inventory.InventoryPickupItemEvent;
+          import cn.nukkit.event.inventory.InventoryTransactionEvent;
+          import cn.nukkit.event.player.PlayerCommandPreprocessEvent;
+          import cn.nukkit.event.player.PlayerDropItemEvent;
+          import cn.nukkit.event.player.PlayerGameModeChangeEvent;
+          import cn.nukkit.event.player.PlayerInteractEvent;
+          import cn.nukkit.event.player.PlayerJoinEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.inventory.Inventory;
+          import cn.nukkit.inventory.PlayerInventory;
+          import cn.nukkit.inventory.transaction.InventoryTransaction;
+          import cn.nukkit.inventory.transaction.action.InventoryAction;
+          import cn.nukkit.inventory.transaction.action.SlotChangeAction;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.nbt.NBTIO;
+          import cn.nukkit.nbt.tag.CompoundTag;
+          import cn.nukkit.nbt.tag.ListTag;
+          import cn.nukkit.plugin.PluginBase;
+          
+          import java.io.IOException;
+          import java.nio.ByteOrder;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.nio.file.StandardCopyOption;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.HashSet;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentHashMap;
+          
+          /**
+           * EclipsGuard 1.3.0
+           *  - banned blocks (bedrock / barrier / end portal frame / command blocks)
+           *  - creative: nothing can leave the player (drop / pickup / containers / PvP / sell)
+           *  - survival -> creative: real inventory is saved to disk and cleared
+           *  - creative -> survival: creative inventory is wiped, real inventory is restored
+           *    (stash lives in plugins/EclipsGuard/stash/<uuid>.dat, survives restarts and relogs)
+           */
+          public class EclipsGuard extends PluginBase implements Listener {
+          
+              private static final int[] BANNED_IDS = {7, 95, 120, 137, 188, 189, -161};
+              private static final String[] BANNED_CLASS_KEYS = {"bedrock", "endportalframe", "barrier", "commandblock"};
+              private static final Set<String> BANNED_NAMES = new HashSet<>(Arrays.asList(
+                      "bedrock", "invisible_bedrock", "end_portal_frame", "barrier",
+                      "command_block", "repeating_command_block", "chain_command_block"));
+              private static final Set<String> HAND_COMMANDS = new HashSet<>(Arrays.asList("sell"));
+              private static final String[] HOLDER_BLOCK_KEYS = {"itemframe", "flowerpot", "lectern", "jukebox", "campfire", "composter"};
+              private static final String[] CREATIVE_GUI_KEYS = {"enchantingtable", "enchanttable", "hopper", "dispenser",
+                      "dropper", "brewingstand", "furnace", "smoker", "craftingtable", "grindstone", "smithingtable", "anvil"};
+              private static final String[] BANNED_ITEM_KEYS = {"spawnegg", "boat", "minecart", "armorstand", "endcrystal"};
+              private static final String[] PHYSICS_BLOCK_KEYS = {"sand", "gravel", "concretepowder", "anvil", "dragonegg"};
+          
+              private static final String MSG_PICKUP = "§c[Eclips] В креативе нельзя подбирать предметы!";
+              private static final String MSG_PVP = "§c[Eclips] В креативе нельзя наносить урон игрокам!";
+              private static final String MSG_GUI = "§c[Eclips] В креативе это открывать нельзя!";
+              private static final String MSG_BANNED = "§c[Eclips] Этот блок ставить нельзя!";
+              private static final String MSG_DROP = "§c[Eclips] В креативе нельзя выбрасывать предметы!";
+              private static final String MSG_STORE = "§c[Eclips] В креативе предметы нельзя никуда перекладывать, продавать или выставлять!";
+              private static final String MSG_SAVED = "§a[Eclips] Твой инвентарь сохранён. Вернётся, когда выйдешь из креатива.";
+              private static final String MSG_RESTORED = "§a[Eclips] Креатив-инвентарь очищен, твой инвентарь возвращён.";
+              private static final String MSG_ITEM = "\u00a7c[Eclips] В креативе этим пользоваться нельзя!";
+              private static final String MSG_ENTITY = "\u00a7c[Eclips] В креативе нельзя взаимодействовать с существами!";
+              private static final String MSG_SHOOT = "\u00a7c[Eclips] В креативе нельзя стрелять и бросать предметы!";
+              private static final String MSG_PHYS = "\u00a7c[Eclips] В креативе нельзя ставить блоки с физикой (песок, гравий и т.п.)!";
+              private static final String MSG_RESTORE_FAIL = "\u00a7c[Eclips] Не удалось вернуть инвентарь! Сообщи админу, данные сохранены.";
+              private static final String MSG_ERR = "§c[Eclips] Не удалось сохранить инвентарь - креатив отменён. Сообщи админу.";
+          
+              private static final int SLOT_ARMOR = 100; // 100..103
+              private static final int SLOT_OFFHAND = 110;
+          
+              private final Set<UUID> bypass = ConcurrentHashMap.newKeySet();
+              private final Map<UUID, Boolean> stashCache = new ConcurrentHashMap<>();
+              private final Map<UUID, Long> denyCooldown = new ConcurrentHashMap<>();
+              private final Map<String, Integer> placed = new ConcurrentHashMap<>();
+              private final Map<UUID, Integer> restoreFails = new ConcurrentHashMap<>();
+              private volatile boolean dirty = false;
+              private Path placedFile;
+              private Path stashDir;
+          
+              // ------------------------------------------------------------------ lifecycle
+          
+              @Override
+              public void onEnable() {
+                  getDataFolder().mkdirs();
+                  placedFile = getDataFolder().toPath().resolve("placed.txt");
+                  stashDir = getDataFolder().toPath().resolve("stash");
+                  try {
+                      Files.createDirectories(stashDir);
+                  } catch (IOException ex) {
+                      getLogger().error("Cannot create stash dir: " + ex);
+                  }
+                  loadPlaced();
+                  getServer().getPluginManager().registerEvents(this, this);
+                  registerPistonProtection();
+                  getServer().getScheduler().scheduleRepeatingTask(this, this::scanPlayers, 5);
+                  getServer().getScheduler().scheduleRepeatingTask(this, this::savePlacedIfDirty, 600);
+                  getLogger().info("EclipsGuard 1.3.0 enabled, tracked blocks: " + placed.size());
+              }
+          
+              @Override
+              public void onDisable() {
+                  savePlaced();
+              }
+          
+              // ------------------------------------------------------------------ helpers
+          
+              private boolean isBypass(Player p) {
+                  return p != null && bypass.contains(p.getUniqueId());
+              }
+          
+              private static boolean isCreativeMode(Player p) {
+                  return p != null && p.getGamemode() == Player.CREATIVE;
+              }
+          
+              private static boolean isBanned(Block b) {
+                  if (b == null) return false;
+                  int id = b.getId();
+                  for (int x : BANNED_IDS) if (x == id) return true;
+                  String cn = b.getClass().getSimpleName().toLowerCase();
+                  for (String k : BANNED_CLASS_KEYS) if (cn.contains(k)) return true;
+                  return false;
+              }
+          
+              private static String key(Block b) {
+                  String lvl = b.getLevel() == null ? "?" : b.getLevel().getFolderName();
+                  return lvl + ":" + b.getFloorX() + ":" + b.getFloorY() + ":" + b.getFloorZ();
+              }
+          
+              private void deny(Player p, String msg) {
+                  long now = System.currentTimeMillis();
+                  Long last = denyCooldown.get(p.getUniqueId());
+                  if (last != null && now - last < 1000) return;
+                  denyCooldown.put(p.getUniqueId(), now);
+                  p.sendMessage(msg);
+              }
+          
+              /** true while the player's real inventory is parked on disk. */
+              private boolean hasStash(Player p) {
+                  UUID id = p.getUniqueId();
+                  return stashCache.computeIfAbsent(id, u -> Files.exists(stashPath(u)));
+              }
+          
+              private Path stashPath(UUID id) {
+                  return stashDir.resolve(id.toString() + ".dat");
+              }
+          
+              /** Everything a creative player must not be able to take out / put away. */
+              private boolean isLocked(Player p) {
+                  return p != null && !isBypass(p) && (isCreativeMode(p) || hasStash(p));
+              }
+          
+              private void resync(Player p) {
+                  if (p == null || !p.isOnline()) return;
+                  try {
+                      PlayerInventory inv = p.getInventory();
+                      inv.sendContents(p);
+                      inv.sendArmorContents(p);
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      p.getCursorInventory().sendContents(p);
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      p.getOffhandInventory().sendContents(p);
+                  } catch (Throwable ignored) {
+                  }
+              }
+          
+              // ------------------------------------------------------------------ inventory stash
+          
+              /** Brings the player's inventory in line with his current gamemode. */
+              private void reconcile(Player p, boolean onJoin) {
+                  if (p == null || !p.isOnline() || isBypass(p)) return;
+                  boolean stashed = hasStash(p);
+                  if (isCreativeMode(p)) {
+                      if (!stashed) {
+                          if (!saveStash(p)) {
+                              p.sendMessage(MSG_ERR);
+                              p.setGamemode(Player.SURVIVAL);
+                              return;
+                          }
+                          wipe(p);
+                          p.sendMessage(MSG_SAVED);
+                      } else if (onJoin) {
+                          // crash / restart while in creative: whatever is in the inventory now is not trusted
+                          wipe(p);
+                      }
+                  } else if (stashed) {
+                      if (loadStash(p)) {
+                          p.sendMessage(MSG_RESTORED);
+                      }
+                  }
+              }
+          
+              private void wipe(Player p) {
+                  PlayerInventory inv = p.getInventory();
+                  inv.clearAll();
+                  Item air = Item.get(0);
+                  inv.setArmorContents(new Item[]{air, air, air, air});
+                  try {
+                      p.getOffhandInventory().clearAll();
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      p.getCursorInventory().clearAll();
+                  } catch (Throwable ignored) {
+                  }
+                  resync(p);
+              }
+          
+              private boolean saveStash(Player p) {
+                  try {
+                      CompoundTag root = new CompoundTag();
+                      ListTag<CompoundTag> list = new ListTag<>("Items");
+                      PlayerInventory inv = p.getInventory();
+                      for (Map.Entry<Integer, Item> en : inv.getContents().entrySet()) {
+                          Item it = en.getValue();
+                          if (it == null || it.isNull()) continue;
+                          list.add(NBTIO.putItemHelper(it, en.getKey()));
+                      }
+                      Item[] armor = inv.getArmorContents();
+                      for (int i = 0; armor != null && i < armor.length && i < 4; i++) {
+                          Item it = armor[i];
+                          if (it == null || it.isNull()) continue;
+                          list.add(NBTIO.putItemHelper(it, SLOT_ARMOR + i));
+                      }
+                      try {
+                          Item off = p.getOffhandInventory().getItem(0);
+                          if (off != null && !off.isNull()) list.add(NBTIO.putItemHelper(off, SLOT_OFFHAND));
+                      } catch (Throwable ignored) {
+                      }
+                      root.putList(list);
+                      byte[] data = NBTIO.writeGZIPCompressed(root, ByteOrder.BIG_ENDIAN);
+          
+                      Path target = stashPath(p.getUniqueId());
+                      Path tmp = stashDir.resolve(p.getUniqueId() + ".tmp");
+                      Files.write(tmp, data);
+                      Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+                      stashCache.put(p.getUniqueId(), Boolean.TRUE);
+                      return true;
+                  } catch (Throwable ex) {
+                      getLogger().error("Stash save failed for " + p.getName() + ": " + ex);
+                      return false;
+                  }
+              }
+          
+              private boolean loadStash(Player p) {
+                  Path file = stashPath(p.getUniqueId());
+                  try {
+                      byte[] data = Files.readAllBytes(file);
+                      CompoundTag root = NBTIO.readCompressed(data, ByteOrder.BIG_ENDIAN);
+                      ListTag<CompoundTag> list = root.getList("Items", CompoundTag.class);
+          
+                      wipe(p);
+                      PlayerInventory inv = p.getInventory();
+                      Item[] armor = new Item[]{Item.get(0), Item.get(0), Item.get(0), Item.get(0)};
+                      Item offhand = null;
+                      for (CompoundTag tag : list.getAll()) {
+                          int slot = tag.getByte("Slot");
+                          Item it = NBTIO.getItemHelper(tag);
+                          if (it == null || it.isNull()) continue;
+                          if (slot >= SLOT_ARMOR && slot < SLOT_ARMOR + 4) {
+                              armor[slot - SLOT_ARMOR] = it;
+                          } else if (slot == SLOT_OFFHAND) {
+                              offhand = it;
+                          } else {
+                              inv.setItem(slot, it);
+                          }
+                      }
+                      inv.setArmorContents(armor);
+                      if (offhand != null) {
+                          try {
+                              p.getOffhandInventory().setItem(0, offhand);
+                          } catch (Throwable ignored) {
+                          }
+                      }
+                      resync(p);
+          
+                      Files.deleteIfExists(file);
+                      stashCache.put(p.getUniqueId(), Boolean.FALSE);
+                      restoreFails.remove(p.getUniqueId());
+                      return true;
+                  } catch (Throwable ex) {
+                      // never leave creative items in a survival player; the file is kept, nothing is lost
+                      try {
+                          wipe(p);
+                      } catch (Throwable ignored) {
+                      }
+                      int n = restoreFails.merge(p.getUniqueId(), 1, Integer::sum);
+                      if (n == 1) {
+                          getLogger().error("Stash restore failed for " + p.getName() + ": " + ex);
+                          p.sendMessage(MSG_RESTORE_FAIL);
+                      }
+                      if (n >= 3) {
+                          // give up: park the file as .bad so the player can play normally, data stays on disk for manual recovery
+                          try {
+                              Files.move(file, stashDir.resolve(p.getUniqueId() + ".bad"), StandardCopyOption.REPLACE_EXISTING);
+                          } catch (Throwable ignored) {
+                          }
+                          stashCache.put(p.getUniqueId(), Boolean.FALSE);
+                          restoreFails.remove(p.getUniqueId());
+                          getLogger().error("Stash of " + p.getName() + " moved to " + p.getUniqueId() + ".bad");
+                      }
+                      return false;
+                  }
+              }
+          
+              private void scanPlayers() {
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      try {
+                          reconcile(p, false);
+                      } catch (Throwable ex) {
+                          getLogger().warning("scan " + p.getName() + ": " + ex);
+                      }
+                  }
+              }
+          
+              // ------------------------------------------------------------------ gamemode / join / quit
+          
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+              public void onGameMode(PlayerGameModeChangeEvent e) {
+                  final Player p = e.getPlayer();
+                  getServer().getScheduler().scheduleDelayedTask(this, () -> reconcile(p, false), 1);
+              }
+          
+              @EventHandler(priority = EventPriority.MONITOR)
+              public void onJoin(PlayerJoinEvent e) {
+                  final Player p = e.getPlayer();
+                  stashCache.remove(p.getUniqueId());
+                  getServer().getScheduler().scheduleDelayedTask(this, () -> reconcile(p, true), 10);
+              }
+          
+              @EventHandler(priority = EventPriority.MONITOR)
+              public void onQuit(PlayerQuitEvent e) {
+                  denyCooldown.remove(e.getPlayer().getUniqueId());
+                  stashCache.remove(e.getPlayer().getUniqueId());
+                  restoreFails.remove(e.getPlayer().getUniqueId());
+              }
+          
+              // ------------------------------------------------------------------ drop / pickup / transactions
+          
+              @EventHandler(priority = EventPriority.HIGHEST)
+              public void onDrop(PlayerDropItemEvent e) {
+                  final Player p = e.getPlayer();
+                  if (!isLocked(p)) return;
+                  e.setCancelled(true);          // item stays in the inventory
+                  deny(p, MSG_DROP);
+                  resync(p);
+                  getServer().getScheduler().scheduleDelayedTask(this, () -> resync(p), 1);
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onPickup(InventoryPickupItemEvent e) {
+                  Inventory inv = e.getInventory();
+                  if (inv == null) return;
+                  Object holder = inv.getHolder();
+                  if (holder instanceof Player) {
+                      Player p = (Player) holder;
+                      if (isLocked(p)) {
+                          e.setCancelled(true);
+                          deny(p, MSG_PICKUP);
+                      }
+                  }
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onTransaction(InventoryTransactionEvent e) {
+                  InventoryTransaction tr = e.getTransaction();
+                  Player p = tr.getSource();
+                  if (!isLocked(p)) return;
+                  for (InventoryAction a : tr.getActions()) {
+                      if (!(a instanceof SlotChangeAction)) continue;
+                      SlotChangeAction sca = (SlotChangeAction) a;
+                      if (!allowedInventory(sca.getInventory())) {
+                          e.setCancelled(true);
+                          deny(p, MSG_STORE);
+                          return;
+                      }
+                  }
+              }
+          
+              private static boolean allowedInventory(Inventory inv) {
+                  if (inv == null || inv instanceof PlayerInventory) return true;
+                  switch (inv.getClass().getSimpleName()) {
+                      case "PlayerCursorInventory":
+                      case "PlayerOffhandInventory":
+                      case "ArmorInventory":
+                      case "PlayerUIInventory":
+                          return true;
+                      default:
+                          return false;
+                  }
+              }
+          
+              // ------------------------------------------------------------------ interact / pvp
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onInteract(PlayerInteractEvent e) {
+                  Player p = e.getPlayer();
+                  if (!isLocked(p)) return;
+                  PlayerInteractEvent.Action act = e.getAction();
+                  if (act != PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK && act != PlayerInteractEvent.Action.RIGHT_CLICK_AIR) return;
+          
+                  Item hand = e.getItem();
+                  boolean hasHand = hand != null && !hand.isNull();
+                  if (hasHand) {
+                      String in = hand.getClass().getSimpleName().toLowerCase();
+                      for (String k : BANNED_ITEM_KEYS) {
+                          if (in.contains(k)) {
+                              e.setCancelled(true);
+                              deny(p, MSG_ITEM);
+                              return;
+                          }
+                      }
+                  }
+                  if (act != PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK) return;
+                  Block b = e.getBlock();
+                  if (b == null) return;
+                  String cn = b.getClass().getSimpleName().toLowerCase();
+                  if (!p.isSneaking()) {
+                      for (String k : CREATIVE_GUI_KEYS) {
+                          if (cn.contains(k)) {
+                              e.setCancelled(true);
+                              deny(p, MSG_GUI);
+                              return;
+                          }
+                      }
+                  }
+                  if (hasHand) {
+                      for (String k : HOLDER_BLOCK_KEYS) {
+                          if (cn.contains(k)) {
+                              e.setCancelled(true);
+                              deny(p, MSG_STORE);
+                              return;
+                          }
+                      }
+                  }
+              }
+          
+              /** armor stands, horses, minecarts, villagers... (human-like NPCs stay usable) */
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onInteractEntity(PlayerInteractEntityEvent e) {
+                  Player p = e.getPlayer();
+                  if (!isLocked(p)) return;
+                  if (e.getEntity() instanceof Player) return;
+                  e.setCancelled(true);
+                  deny(p, MSG_ENTITY);
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onShootBow(EntityShootBowEvent e) {
+                  Entity en = e.getEntity();
+                  if (en instanceof Player && isLocked((Player) en)) {
+                      e.setCancelled(true);
+                      deny((Player) en, MSG_SHOOT);
+                  }
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onLaunch(ProjectileLaunchEvent e) {
+                  Entity en = e.getEntity();
+                  if (!(en instanceof EntityProjectile)) return;
+                  Entity shooter = ((EntityProjectile) en).shootingEntity;
+                  if (shooter instanceof Player && isLocked((Player) shooter)) {
+                      e.setCancelled(true);
+                      deny((Player) shooter, MSG_SHOOT);
+                  }
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH)
+              public void onDeath(PlayerDeathEvent e) {
+                  Entity en = e.getEntity();
+                  if (en instanceof Player && isLocked((Player) en)) {
+                      e.setDrops(new Item[0]);
+                  }
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onDamage(EntityDamageByEntityEvent e) {
+                  if (!(e.getDamager() instanceof Player)) return;
+                  Player d = (Player) e.getDamager();
+                  if (isBypass(d)) return;
+                  if ((isCreativeMode(d) || hasStash(d)) && e.getEntity() instanceof Player) {
+                      e.setCancelled(true);
+                      deny(d, MSG_PVP);
+                  }
+              }
+          
+              // ------------------------------------------------------------------ banned blocks
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onPlace(BlockPlaceEvent e) {
+                  Block b = e.getBlock();
+                  Player p = e.getPlayer();
+                  if (b == null || p == null) return;
+                  if (isBanned(b)) {
+                      if (isBypass(p)) {
+                          placed.put(key(b), b.getId());
+                          dirty = true;
+                      } else {
+                          e.setCancelled(true);
+                          deny(p, MSG_BANNED);
+                      }
+                      return;
+                  }
+                  if (isLocked(p)) {
+                      String cn = b.getClass().getSimpleName().toLowerCase();
+                      boolean physics = b instanceof BlockFall;
+                      for (String k : PHYSICS_BLOCK_KEYS) if (cn.contains(k)) physics = true;
+                      if (physics) {
+                          e.setCancelled(true);
+                          deny(p, MSG_PHYS);
+                          return;
+                      }
+                      if (cn.contains("tnt")) {
+                          e.setCancelled(true);
+                          deny(p, MSG_ITEM);
+                          return;
+                      }
+                      // placed in creative: no drops when it is broken or blown up
+                      placed.put(key(b), b.getId());
+                      dirty = true;
+                  } else if (placed.remove(key(b)) != null) {
+                      // a normal player builds on a spot with a stale record
+                      dirty = true;
+                  }
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onBreak(BlockBreakEvent e) {
+                  Block b = e.getBlock();
+                  Integer id = placed.remove(key(b));
+                  if (id == null) return;
+                  dirty = true;
+                  if (id == b.getId() && !isBypass(e.getPlayer())) {
+                      e.setDrops(new Item[0]);
+                  }
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onExplode(EntityExplodeEvent e) {
+                  List<Block> list = new ArrayList<>(e.getBlockList());
+                  boolean changed = false;
+                  Iterator<Block> it = list.iterator();
+                  while (it.hasNext()) {
+                      Block b = it.next();
+                      Integer id = placed.remove(key(b));
+                      if (id == null) continue;
+                      dirty = true;
+                      changed = true;
+                      it.remove();
+                      if (id == b.getId()) {
+                          b.getLevel().setBlock(b, Block.get(0, 0));
+                      }
+                  }
+                  if (changed) e.setBlockList(list);
+              }
+          
+              // ------------------------------------------------------------------ frozen creative blocks (no physics)
+          
+              private boolean isTracked(Block b) {
+                  return b != null && !placed.isEmpty() && placed.containsKey(key(b));
+              }
+          
+              /** neighbour updates: gravity, torches/plants losing support, redstone... */
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onBlockUpdate(BlockUpdateEvent e) {
+                  if (isTracked(e.getBlock())) e.setCancelled(true);
+              }
+          
+              /** water / lava flowing into (and destroying) a creative block */
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onFlow(BlockFromToEvent e) {
+                  if (isTracked(e.getTo())) e.setCancelled(true);
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onLeavesDecay(LeavesDecayEvent e) {
+                  if (isTracked(e.getBlock())) e.setCancelled(true);
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onGrow(BlockGrowEvent e) {
+                  if (isTracked(e.getBlock())) e.setCancelled(true);
+              }
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onStructureGrow(StructureGrowEvent e) {
+                  if (isTracked(e.getBlock())) e.setCancelled(true);
+              }
+          
+              /** pistons: event class differs between cores, so it is looked up by name */
+              private void registerPistonProtection() {
+                  try {
+                      Class<? extends Event> cls = Class.forName("cn.nukkit.event.block.BlockPistonEvent").asSubclass(Event.class);
+                      getServer().getPluginManager().registerEvent(cls, this, EventPriority.HIGH, (l, ev) -> onPiston(ev), this);
+                      getLogger().info("Piston protection enabled");
+                  } catch (Throwable t) {
+                      getLogger().warning("Piston event not available, pistons can still move creative blocks: " + t);
+                  }
+              }
+          
+              private void onPiston(Event ev) {
+                  try {
+                      if (placed.isEmpty() || !(ev instanceof Cancellable)) return;
+                      for (String m : new String[]{"getBlocksToMove", "getBlocksToDestroy"}) {
+                          Object r = ev.getClass().getMethod(m).invoke(ev);
+                          if (!(r instanceof Collection)) continue;
+                          for (Object o : (Collection<?>) r) {
+                              if (o instanceof Block && isTracked((Block) o)) {
+                                  ((Cancellable) ev).setCancelled(true);
+                                  return;
+                              }
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                  }
+              }
+          
+              // ------------------------------------------------------------------ commands
+          
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onCommand(PlayerCommandPreprocessEvent e) {
+                  Player p = e.getPlayer();
+                  if (isBypass(p)) return;
+                  String msg = e.getMessage();
+                  if (msg == null || !msg.startsWith("/")) return;
+                  String[] parts = msg.substring(1).trim().split("\\s+");
+                  if (parts.length == 0 || parts[0].isEmpty()) return;
+                  String label = parts[0].toLowerCase();
+                  if (label.startsWith("minecraft:")) label = label.substring(10);
+                  Command c = getServer().getCommandMap().getCommand(label);
+                  String name = c != null ? c.getName().toLowerCase() : label;
+          
+                  if (HAND_COMMANDS.contains(name) && isLocked(p)) {
+                      e.setCancelled(true);
+                      deny(p, MSG_STORE);
+                      return;
+                  }
+                  // any command (setblock, fill, execute ... run setblock, clone, //set ...) naming a banned block
+                  for (int i = 1; i < parts.length; i++) {
+                      String a = parts[i].toLowerCase();
+                      if (a.startsWith("minecraft:")) a = a.substring(10);
+                      int br = a.indexOf('[');
+                      if (br >= 0) a = a.substring(0, br);
+                      if (BANNED_NAMES.contains(a)) {
+                          e.setCancelled(true);
+                          deny(p, MSG_BANNED);
+                          return;
+                      }
+                  }
+              }
+          
+              @Override
+              public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+                  if (!cmd.getName().equalsIgnoreCase("gmhack")) return false;
+                  if (!sender.hasPermission("eclipsguard.gmhack")) {
+                      sender.sendMessage("§cНет прав.");
+                      return true;
+                  }
+                  Player target;
+                  String mode;
+                  if (args.length == 1 && isMode(args[0])) {
+                      if (!(sender instanceof Player)) {
+                          sender.sendMessage("§eИспользование: /gmhack <ник> <on/off>");
+                          return true;
+                      }
+                      target = (Player) sender;
+                      mode = args[0];
+                  } else if (args.length >= 2 && isMode(args[1])) {
+                      target = getServer().getPlayerExact(args[0]);
+                      if (target == null) target = getServer().getPlayer(args[0]);
+                      mode = args[1];
+                      if (target == null) {
+                          sender.sendMessage("§cИгрок не найден.");
+                          return true;
+                      }
+                  } else {
+                      sender.sendMessage("§eИспользование: /gmhack [ник] <on/off>");
+                      return true;
+                  }
+                  boolean on = isOn(mode);
+                  if (on) bypass.add(target.getUniqueId());
+                  else bypass.remove(target.getUniqueId());
+                  String state = on ? "§aвключён" : "§cвыключен";
+                  sender.sendMessage("§e[Eclips] Обход ограничений для " + target.getName() + ": " + state);
+                  if (target != sender) target.sendMessage("§e[Eclips] Обход ограничений: " + state);
+                  return true;
+              }
+          
+              private static boolean isMode(String s) {
+                  s = s.toLowerCase();
+                  return s.equals("on") || s.equals("off") || s.equals("вкл") || s.equals("выкл");
+              }
+          
+              private static boolean isOn(String s) {
+                  s = s.toLowerCase();
+                  return s.equals("on") || s.equals("вкл");
+              }
+          
+              // ------------------------------------------------------------------ placed.txt
+          
+              private void loadPlaced() {
+                  placed.clear();
+                  if (!Files.exists(placedFile)) return;
+                  try {
+                      for (String line : Files.readAllLines(placedFile, StandardCharsets.UTF_8)) {
+                          int i = line.lastIndexOf('=');
+                          if (i <= 0) continue;
+                          try {
+                              placed.put(line.substring(0, i), Integer.parseInt(line.substring(i + 1).trim()));
+                          } catch (NumberFormatException ignored) {
+                          }
+                      }
+                  } catch (IOException ex) {
+                      getLogger().warning("placed.txt: " + ex);
+                  }
+              }
+          
+              private void savePlacedIfDirty() {
+                  if (dirty) savePlaced();
+              }
+          
+              private void savePlaced() {
+                  try {
+                      List<String> lines = new ArrayList<>();
+                      for (Map.Entry<String, Integer> en : placed.entrySet()) lines.add(en.getKey() + "=" + en.getValue());
+                      Files.write(placedFile, lines, StandardCharsets.UTF_8);
+                      dirty = false;
+                  } catch (IOException ex) {
+                      getLogger().warning("placed.txt save: " + ex);
+                  }
+              }
+          }
+          EOF_JAVA
+      - name: Build
+        run: mvn -B -f eg/pom.xml clean package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EclipsGuard
+          path: eg/target/EclipsGuard.jar
